@@ -303,6 +303,11 @@ type Server struct {
 
 	lock    sync.RWMutex
 	started bool
+
+	// WorkerLimit sets maximum number of worker to run simultaneously. If it's less than one
+	// no limit enforced.
+	WorkerLimit int
+	th          chan int
 }
 
 // ListenAndServe starts a nameserver on the configured address in *Server.
@@ -385,6 +390,13 @@ func (srv *Server) ActivateAndServe() error {
 	}
 	pConn := srv.PacketConn
 	l := srv.Listener
+
+	if srv.WorkerLimit > 0 {
+		srv.th = make(chan int, srv.WorkerLimit)
+	} else {
+		srv.th = nil
+	}
+
 	if pConn != nil {
 		if srv.UDPSize == 0 {
 			srv.UDPSize = MinMsgSize
@@ -494,7 +506,7 @@ func (srv *Server) serveTCP(l net.Listener) error {
 			continue
 		}
 		srv.inFlight.Add(1)
-		go srv.serve(rw.RemoteAddr(), handler, m, nil, nil, rw)
+		go srv.serve(rw.RemoteAddr(), handler, m, nil, nil, rw, nil)
 	}
 }
 
@@ -525,18 +537,27 @@ func (srv *Server) serveUDP(l *net.UDPConn) error {
 			srv.lock.RUnlock()
 			return nil
 		}
+		th := srv.th
 		srv.lock.RUnlock()
 		if err != nil {
 			continue
 		}
 		srv.inFlight.Add(1)
-		go srv.serve(s.RemoteAddr(), handler, m, l, s, nil)
+		if th != nil {
+			th <- 0
+		}
+		go srv.serve(s.RemoteAddr(), handler, m, l, s, nil, th)
 	}
 }
 
 // Serve a new connection.
-func (srv *Server) serve(a net.Addr, h Handler, m []byte, u *net.UDPConn, s *SessionUDP, t net.Conn) {
-	defer srv.inFlight.Done()
+func (srv *Server) serve(a net.Addr, h Handler, m []byte, u *net.UDPConn, s *SessionUDP, t net.Conn, th chan int) {
+	defer func() {
+		if th != nil {
+			<-th
+		}
+		srv.inFlight.Done()
+	}()
 
 	w := &response{tsigSecret: srv.TsigSecret, udp: u, tcp: t, remoteAddr: a, udpSession: s}
 	if srv.DecorateWriter != nil {
